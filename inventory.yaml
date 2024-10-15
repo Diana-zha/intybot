@@ -1,0 +1,24 @@
+[all:vars]
+TOKEN="7525621042:AAHuB665_u0Jvi8fzJfOkfNMZlhGcv_CKz8"
+DB_HOST=192.168.22.148
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=123
+DB_DATABASE=db_customers
+DB_REPL_USER=repl_user
+DB_REPL_PASSWORD=123
+DB_REPL_HOST=192.168.22.149
+DB_REPL_PORT=5432
+RM_HOST=192.168.22.142
+RM_PORT=22
+RM_USER=diana
+RM_PASSWORD=123
+
+[TG_Bot]
+tg_bot_host ansible_host=192.168.22.147 ansible_user=tg_ansible ansible_ssh_pass=123 ansible_become_pass=123
+
+[DB]
+db_server ansible_host=192.168.22.148 ansible_user=tg_ansible ansible_ssh_pass=123 ansible_become_pass=123
+
+[db_repl]
+db_repl_server ansible_host=192.168.22.149 ansible_user=db_repl_ansible ansible_ssh_pass=123 ansible_become_pass=123

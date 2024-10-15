@@ -1,0 +1,284 @@
+- name: Задачи для серверов БД
+  hosts: DB,db_repl
+  become: yes
+  tasks:
+    - name: Обновление пакетов
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 120000
+
+    - name: Добавление ключа репозитория PostgreSQL
+      apt_key:
+        url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+        state: present
+
+    - name: Добавление репозитория PostgreSQL
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt/ jammy-pgdg main"
+        state: present
+        filename: "PostgreSQL_repo"
+
+    - name: Установка пакетов PostgreSQL
+      apt:
+        name:
+          - postgresql-15
+          - postgresql-contrib
+        state: present
+
+    - name: Установка pip
+      apt:
+        name: python3-pip
+        state: present
+
+    - name: Установка библиотеки psycopg2-binary
+      pip:
+        name: psycopg2-binary
+        state: present
+
+    - name: Проверка, установлен ли PostgreSQL
+      command: "psql --version"
+      ignore_errors: yes
+      register: psql_version
+
+    - name: Ошибка, если PostgreSQL не установлен
+      fail:
+        msg: "PostgreSQL не был установлен"
+      when: psql_version.failed
+
+    - name: Получение статуса кластера PostgreSQL
+      command: pg_ctlcluster 15 main status
+      ignore_errors: yes
+      register: postgres_status
+
+    - name: Если кластер PostgreSQL не запущен, запустить его
+      command: pg_ctlcluster 15 main start
+      when: postgres_status is defined and postgres_status.stdout.find('is not running') != -1
+
+- name: Основная конфигурация сервера БД
+  hosts: DB
+  become: yes
+  tasks:
+    - name: Создание каталога для архивов PostgreSQL
+      file:
+        path: /oracle/pg_data/archive/
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0755'
+        recurse: yes
+
+    - name: Конфигурация pg_hba.conf
+      blockinfile:
+        create: true
+        path: /etc/postgresql/15/main/pg_hba.conf
+        block: |
+          local all {{ hostvars[inventory_hostname]['DB_USER'] }} peer
+          host all all "{{ hostvars[inventory_hostname]['DB_HOST'] }}"/24 trust
+          host replication {{ hostvars[inventory_hostname]['DB_REPL_USER'] }} {{ hostvars[inventory_hostname]['DB_REPL_HOST'] }}/24 trust
+
+    - name: Конфигурация postgresql.conf
+      blockinfile:
+        create: true
+        path: /etc/postgresql/15/main/postgresql.conf
+        block: |
+          listen_addresses = '*'
+          port = 5432
+          log_destination = 'stderr'
+          logging_collector = on
+          log_directory = '/var/log/postgresql/'
+          log_filename = 'postgresql.log'
+          log_file_mode = 0644
+          archive_mode = on
+          archive_command = 'cp %p /oracle/pg_data/archive/%f'
+          max_wal_senders = 10
+          wal_level = replica
+          wal_log_hints = on
+          log_replication_commands = on
+
+    - name: Перезапуск службы PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
+
+    - name: Создание базы данных
+      community.general.postgresql_db:
+        name: "{{ hostvars[inventory_hostname]['DB_DATABASE'] }}"
+        encoding: UTF-8
+        template: template0
+      become: yes
+      become_user: postgres
+
+    - name: Создание таблиц для email и номеров телефонов
+      shell: |
+        psql -d {{ hostvars[inventory_hostname]['DB_DATABASE'] }} -c "CREATE TABLE IF NOT EXISTS users (id serial PRIMARY KEY, email text);"
+        psql -d {{ hostvars[inventory_hostname]['DB_DATABASE'] }} -c "CREATE TABLE IF NOT EXISTS phone_numbers (id serial PRIMARY KEY, phone_number text);"
+      become_user: postgres
+      ignore_errors: true
+
+
+    - name: Вставка данных в таблицу users
+      command: |
+        psql -d {{ hostvars[inventory_hostname]['DB_DATABASE'] }} -c "
+        INSERT INTO users (email)
+        VALUES ('test1@example.com'), ('test2@example2.eu');"
+      become_user: postgres
+
+    - name: Вставка данных в таблицу phone_numbers
+      command: |
+        psql -d {{ hostvars[inventory_hostname]['DB_DATABASE'] }} -c "
+        INSERT INTO phone_numbers (phone_number)
+        VALUES ('87777777777'), ('+71231231212');"
+      become_user: postgres
+
+
+    - name: Изменение пароля пользователя postgres
+      command: psql -c "ALTER USER {{ hostvars[inventory_hostname]['DB_USER'] }} WITH PASSWORD '{{ hostvars[inventory_hostname]['DB_PASSWORD'] }}';"
+      become_user: postgres
+
+    - name: Create user for replication
+      command: psql -c "DO $$ BEGIN CREATE ROLE {{ hostvars[inventory_hostname]['DB_REPL_USER'] }} REPLICATION LOGIN SUPERUSER PASSWORD '{{ hostvars[inventory_hostname]['DB_REPL_PASSWORD'] }}'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+      become_user: postgres
+
+- name: Конфигурация сервера репликации
+  hosts: db_repl
+  become: yes
+  tasks:
+    - name: Проверка, запущен ли PostgreSQL
+      ansible.builtin.command:
+        cmd: "pg_ctlcluster 15 main status"
+      register: postgres_status
+      ignore_errors: true
+      become: yes
+      become_user: root
+
+    - name: Если кластер PostgreSQL не существует, создать его
+      ansible.builtin.command:
+        cmd: "pg_createcluster 15 main"
+      when: postgres_status.stdout.find('specified cluster \'15 main\' does not exist') != -1
+      become: yes
+      become_user: root
+
+    - name: Настройка postgresql.conf
+      blockinfile:
+        create: true
+        path: /etc/postgresql/15/main/postgresql.conf
+        block: |
+          listen_addresses = 'localhost, {{ hostvars[inventory_hostname]['DB_REPL_HOST'] }}'
+          port = {{ hostvars[inventory_hostname]['DB_REPL_PORT'] }}
+          log_destination = 'stderr'
+          logging_collector = on
+          log_directory = '/var/log/postgresql/'
+          log_filename = 'postgresql.log'
+          log_file_mode = 0644
+
+    - name: Остановка службы PostgreSQL перед бэкапом
+      service:
+        name: postgresql
+        state: stopped
+
+    - name: Очистка старых данных перед бэкапом
+      command: rm -rf /var/lib/postgresql/15/main/*
+      become_user: root
+
+    - name: Убедиться, что каталог очищен перед бэкапом
+      command: find /var/lib/postgresql/15/main/ -mindepth 1 -delete
+      become: true
+
+    - name: Выполнение pg_basebackup
+      command: "pg_basebackup -R -h {{ hostvars[inventory_hostname]['DB_HOST'] }} -U {{ hostvars[inventory_hostname]['DB_REPL_USER'] }} -D /var/lib/postgresql/15/main -P"
+      become_user: postgres
+      environment:
+        PGPASSWORD: "{{ hostvars[inventory_hostname]['DB_REPL_PASSWORD'] }}"
+
+    - name: Установка прав на каталог репликации
+      file:
+        path: /var/lib/postgresql/15/main/
+        owner: postgres
+        group: postgres
+        recurse: yes
+      become: true
+
+    - name: Обеспечение правильных прав на каталог PostgreSQL
+      command: chown -R postgres:postgres /var/lib/postgresql/
+      become: true
+
+    - name: Запуск службы PostgreSQL
+      service:
+        name: postgresql
+        state: started
+- name: Развертывание TG бота
+  hosts: TG_Bot
+  become: yes
+  vars:
+    raw_git_repo: "https://raw.githubusercontent.com/Diana-zha/intybot/refs/heads/docker/devops_bot/tg_bot"
+    working_directory: "/home/diana/tg_bot"
+  tasks:
+    - name: Установка зависимостей
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Создание рабочего каталога
+      file:
+        path: "{{ working_directory }}"
+        state: directory
+        mode: '0777'
+
+    - name: Клонирование requirements для TG бота
+      ansible.builtin.get_url:
+        url: "{{ raw_git_repo }}/app_bot.py"
+        dest: /home/diana/tg_bot/app_bot.py
+
+    - name: Клонирование requirements для TG бота
+      ansible.builtin.get_url:
+        url: "{{ raw_git_repo }}/requirements.txt"
+        dest: /home/diana/tg_bot/requirements.txt
+
+    - name: Установка зависимостей Python из requirements
+      pip:
+        requirements: /home/diana/tg_bot/requirements.txt
+
+    - name: Создание файла .env с переменными из inventory
+      copy:
+        dest: "{{ working_directory }}/.env"
+        content: |
+          TOKEN={{ hostvars[inventory_hostname]['TOKEN'] }}
+          DB_HOST={{ hostvars[inventory_hostname]['DB_HOST'] }}
+          DB_PORT={{ hostvars[inventory_hostname]['DB_PORT'] }}
+          DB_USER={{ hostvars[inventory_hostname]['DB_USER'] }}
+          DB_PASSWORD={{ hostvars[inventory_hostname]['DB_PASSWORD'] }}
+          DB_USER={{ hostvars[inventory_hostname]['DB_USER'] }}
+          DB_PASSWORD={{ hostvars[inventory_hostname]['DB_PASSWORD'] }}
+          DB_DATABASE={{ hostvars[inventory_hostname]['DB_DATABASE'] }}
+          RM_HOST={{ hostvars[inventory_hostname]['RM_HOST'] }}
+          RM_PORT={{ hostvars[inventory_hostname]['RM_PORT'] }}
+          RM_USER={{ hostvars[inventory_hostname]['RM_USER'] }}
+          RM_PASSWORD={{ hostvars[inventory_hostname]['RM_PASSWORD'] }}
+
+    - name: Проверка и завершение существующего процесса TG бота
+      ansible.builtin.shell: |
+        # Получаем PID процессов
+        pids=$(pgrep -f 'app_bot.py')
+        if [ -n "$pids" ]; then
+          echo "Завершение процессов с PID: $pids"
+          echo "$pids" | xargs kill
+          # Проверка, были ли успешно завершены процессы
+          for pid in $pids; do
+            if ps -p $pid > /dev/null; then
+              echo "Не удалось завершить процесс с PID: $pid"
+            else
+              echo "Процесс с PID: $pid успешно завершён"
+            fi
+          done
+        else
+          echo "Процесс не найден."
+        fi
+      ignore_errors: true  # Игнорируем ошибки, если процесс не найден
+
+    - name: Запуск TG бота
+      ansible.builtin.shell: nohup python3 /home/diana/tg_bot/app_bot.py &
